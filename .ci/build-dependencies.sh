@@ -162,6 +162,10 @@ register_library_path
 #     including <time.h>. Do NOT "fix" this with -Wno-implicit-function-declaration: an
 #     implicitly declared time() is assumed to return int, which truncates time_t on 64-bit.
 #
+# DIGEST-MD5 keeps its full cipher set, so max_ssf stays 128 and auth-conf negotiates as it
+#     does for a source build. RC4 fetches from OpenSSL's legacy provider, which is not
+#     activated by default on any distribution, hence the provider patch below.
+#
 # -D_GNU_SOURCE for asprintf/memmem in the utils.
 # --without-saslauthd --without-pwcheck : server-side daemons we do not ship, and they fail
 #     to build for the same implicit-declaration reason.
@@ -170,6 +174,16 @@ cd "${BUILD_DIR}"
 curl -fsSL "https://github.com/cyrusimap/cyrus-sasl/releases/download/cyrus-sasl-${CYRUS_SASL_VERSION}/cyrus-sasl-${CYRUS_SASL_VERSION}.tar.gz" | tar xzf -
 cd "cyrus-sasl-${CYRUS_SASL_VERSION}"
 
+# Upstream 887dbc0, released after 2.1.28. A DIGEST-MD5 cipher whose init fails leaves a NULL
+# cipher context that the client installs anyway, so the bind succeeds and the first operation
+# through the security layer dereferences it. The patch turns that into a bind failure.
+patch -p1 < "${SOURCE_DIR}/.ci/patches/0001-digestmd5-handle-failed-cipher-init.patch"
+
+# Activates OpenSSL 3's legacy provider, which supplies the RC4 ciphers. Not an upstream
+# commit: Cyrus SASL has no provider handling at all, and distributions that keep DIGEST-MD5
+# working on OpenSSL 3 carry an equivalent change of their own.
+patch -p1 < "${SOURCE_DIR}/.ci/patches/0002-digestmd5-load-openssl-legacy-provider.patch"
+
 ./configure --prefix="${PREFIX}" \
     --enable-static --disable-shared \
     --enable-scram --enable-digest --enable-cram --enable-plain --enable-anon \
@@ -177,17 +191,16 @@ cd "cyrus-sasl-${CYRUS_SASL_VERSION}"
     --without-dblib --without-saslauthd --without-pwcheck \
     --with-openssl="${PREFIX}" \
     CFLAGS="-fPIC -D_GNU_SOURCE -include time.h -I${PREFIX}/include" \
-    LDFLAGS="-L${PREFIX}/lib"
+    LDFLAGS="-L${PREFIX}/lib" \
+    LIBS="-lcrypto"
 
-# Cyrus SASL does not fail when it cannot find OpenSSL. It drops SCRAM entirely, builds
-# DIGEST-MD5 without DES, prints two warnings, and exits 0. A wheel built that way advertises
-# mechanisms it does not have and fails only on the user's machine, at bind time, depending on
-# which mechanism the server negotiates. The configure output is therefore treated as a hard
-# gate that aborts the build.
+# Cyrus SASL does not fail when it cannot find OpenSSL. It drops SCRAM entirely, prints a
+# warning, and exits 0. A wheel built that way advertises mechanisms it does not have and
+# fails only on the user's machine, at bind time, depending on which mechanism the server
+# negotiates. The configure output is therefore treated as a hard gate that aborts the build.
 log "Verifying Cyrus SASL configuration (it degrades silently and still exits 0)"
-grep -q "SCRAM will be disabled"  config.log && fail "SCRAM disabled: OpenSSL was not found by cyrus-sasl"
-grep -q "No DES support"          config.log && fail "DIGEST-MD5 built without DES support"
-echo "  SCRAM enabled, DES support present."
+grep -q "SCRAM will be disabled" config.log && fail "SCRAM disabled: OpenSSL was not found by cyrus-sasl"
+echo "  SCRAM enabled."
 
 make -j"${JOBS}"
 make install
@@ -200,6 +213,15 @@ for mech in plain anonymous crammd5 digestmd5 scram external; do
 done
 echo "  All six client mechanisms present in libsasl2.a."
 
+for cipher in enc_rc4 enc_des enc_3des; do
+    if [[ "${sasl_symbols}" != *"${cipher}"* ]]; then
+        fail "DIGEST-MD5 was built without ${cipher}: it cannot negotiate auth-conf"
+    fi
+done
+if [[ "${sasl_symbols}" != *digestmd5_load_providers* ]]; then
+    fail "DIGEST-MD5 has no provider load: RC4 will fetch from an inactive legacy provider"
+fi
+echo "  DIGEST-MD5 offers its full cipher set."
 
 # ---------------------------------------------------------------------------------------
 # OpenLDAP: shared, absorbing the static libsasl2
