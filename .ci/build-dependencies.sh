@@ -303,6 +303,25 @@ echo "  No libsasl2 dependency, no dlopen/dlsym imports, all six mechanisms abso
 # liblber installed above.
 register_library_path
 
+# Collect the upstream licenses. The wheel redistributes these libraries in binary form, and
+# Cyrus SASL's license in particular requires acknowledgement in redistributions.
+log "Collecting third-party licenses"
+mkdir -p "${PREFIX}/licenses"
+collect_license() {
+    local name="$1" dir="$2" found=""
+    for candidate in LICENSE LICENSE.txt COPYING COPYRIGHT; do
+        if [ -f "${dir}/${candidate}" ]; then
+            cat "${dir}/${candidate}" >> "${PREFIX}/licenses/${name}.txt"
+            found="yes"
+        fi
+    done
+    [ -n "${found}" ] || fail "no license file found for ${name} in ${dir}"
+    echo "  ${name}"
+}
+collect_license openssl    "${BUILD_DIR}/openssl-${OPENSSL_VERSION}"
+collect_license cyrus-sasl "${BUILD_DIR}/cyrus-sasl-${CYRUS_SASL_VERSION}"
+collect_license openldap   "${BUILD_DIR}/openldap-${OPENLDAP_VERSION}"
+
 # Record what was bundled, so the wheel build can report these versions at run time.
 cat > "${PREFIX}/bundled-versions.env" <<EOF
 BONSAI_BUNDLED_OPENSSL_VERSION=${OPENSSL_VERSION}
