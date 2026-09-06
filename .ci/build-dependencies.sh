@@ -162,6 +162,13 @@ register_library_path
 #     including <time.h>. Do NOT "fix" this with -Wno-implicit-function-declaration: an
 #     implicitly declared time() is assumed to return int, which truncates time_t on 64-bit.
 #
+# --enable-ntlm
+#     Off by default upstream, but bonsai documents and tests NTLM, and a source build on
+#     Debian or Ubuntu gets it from libsasl2-modules, so a wheel without it would lose
+#     working authentication. Its DES use is its own: ntlm.c carries private des_* macros
+#     that do not consult WITH_DES, and it sets odd key parity before scheduling, so it is
+#     unaffected by how DIGEST-MD5's ciphers are configured.
+#
 # DIGEST-MD5 keeps its full cipher set, so max_ssf stays 128 and auth-conf negotiates as it
 #     does for a source build. RC4 fetches from OpenSSL's legacy provider, which is not
 #     activated by default on any distribution, hence the provider patch below.
@@ -187,6 +194,7 @@ patch -p1 < "${SOURCE_DIR}/.ci/patches/0002-digestmd5-load-openssl-legacy-provid
 ./configure --prefix="${PREFIX}" \
     --enable-static --disable-shared \
     --enable-scram --enable-digest --enable-cram --enable-plain --enable-anon \
+    --enable-ntlm \
     --disable-gssapi --disable-otp --disable-srp --disable-sample \
     --without-dblib --without-saslauthd --without-pwcheck \
     --with-openssl="${PREFIX}" \
@@ -206,12 +214,12 @@ make -j"${JOBS}"
 make install
 
 sasl_symbols=$(nm "${PREFIX}/lib/libsasl2.a")
-for mech in plain anonymous crammd5 digestmd5 scram external; do
+for mech in plain anonymous crammd5 digestmd5 scram external ntlm; do
     if [[ "${sasl_symbols}" != *" T ${mech}_client_plug_init"* ]]; then
         fail "mechanism ${mech} missing from libsasl2.a"
     fi
 done
-echo "  All six client mechanisms present in libsasl2.a."
+echo "  All seven client mechanisms present in libsasl2.a."
 
 for cipher in enc_rc4 enc_des enc_3des; do
     if [[ "${sasl_symbols}" != *"${cipher}"* ]]; then
@@ -269,7 +277,7 @@ if [[ "${ldap_undefined}" == *dlopen* || "${ldap_undefined}" == *dlsym* ]]; then
 fi
 
 ldap_symbols=$(nm --defined-only "${LIBLDAP}")
-for mech in plain anonymous crammd5 digestmd5 scram external; do
+for mech in plain anonymous crammd5 digestmd5 scram external ntlm; do
     if [[ "${ldap_symbols}" != *"${mech}_client_plug_init"* ]]; then
         fail "mechanism ${mech} was not absorbed into libldap"
     fi
@@ -297,7 +305,7 @@ for lib in "${PREFIX}"/lib/*.so.*; do
 done
 
 echo "  ${LIBLDAP}"
-echo "  No libsasl2 dependency, no dlopen/dlsym imports, all six mechanisms absorbed."
+echo "  No libsasl2 dependency, no dlopen/dlsym imports, all seven mechanisms absorbed."
 
 # Refresh the loader cache, which is what lets the wheel build link against the libldap and
 # liblber installed above.
