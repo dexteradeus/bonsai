@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from distutils.errors import CompileError, LinkError
 
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 from setuptools import setup, Extension
 
 
@@ -78,7 +79,28 @@ class BuildExt(build_ext):
                     "INFO: Kerberos headers and libraries are not found."
                     " Additional GSSAPI capabilities won't be installed."
                 )
+        if self.get_finalized_command("build_py").bundled_deps:
+            self.extensions[0].define_macros.append(("BONSAI_BUNDLED", 1))
         return super().build_extensions()
+
+
+class BuildPy(build_py):
+    """Custom build_py to carry the location of the bundled native dependencies."""
+
+    # The prefix the native dependencies were installed into for the build. Only a wheel
+    # build sets it, so BuildExt reads it back from here to decide whether to define
+    # BONSAI_BUNDLED.
+    user_options = build_py.user_options + [
+        (
+            "bundled-deps=",
+            None,
+            "install prefix of the native dependencies to bundle into the wheel",
+        )
+    ]
+
+    def initialize_options(self) -> None:
+        super().initialize_options()
+        self.bundled_deps = None
 
 
 SOURCES = [
@@ -141,7 +163,7 @@ setup(
     author="noirello",
     author_email="noirello@gmail.com",
     ext_modules=[BONSAI_MODULE],
-    cmdclass={"build_ext": BuildExt},
+    cmdclass={"build_ext": BuildExt, "build_py": BuildPy},
     package_dir={"bonsai": "src/bonsai"},
     package_data={"bonsai": ["py.typed"]},
     packages=[
