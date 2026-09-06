@@ -66,7 +66,48 @@ class BuildExt(build_ext):
             else:
                 return True
 
+    def _accepts_flags(self, compile_args: list, link_args: list) -> bool:
+        """Check that the toolchain accepts the flags, since they are GNU ld specific."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            name = os.path.join(tmp_dir, "test_flags")
+            src_name = name + ".c"
+            with open(src_name, "w") as source:
+                source.write("int PyInit__bonsai(void) { return 0; }\n")
+            comp = self.compiler
+            try:
+                with silent_stderr():
+                    comp.link_shared_object(
+                        comp.compile(
+                            [src_name], output_dir=tmp_dir, extra_postargs=compile_args
+                        ),
+                        name + ".so",
+                        extra_postargs=link_args,
+                    )
+            except (CompileError, LinkError):
+                return False
+            else:
+                return True
+
+    def _harden_symbols(self) -> None:
+        """Export only the module init symbol from the extension.
+
+        The extension defines ~60 globals with names general enough to collide with another
+        extension in the same interpreter, such as `lowercase` and `set_exception`. Hiding
+        them also keeps the bundled OpenSSL and OpenLDAP symbols out of the wheel's dynamic
+        symbol table, so nothing loaded later can bind to them by accident.
+        """
+        version_script = str(CURRDIR / "src" / "_bonsai" / "bonsai.map")
+        compile_args = ["-fvisibility=hidden"]
+        link_args = [f"-Wl,--version-script={version_script}"]
+        if not self._accepts_flags(compile_args, link_args):
+            print("INFO: toolchain does not accept symbol visibility flags, skipping.")
+            return
+        self.extensions[0].extra_compile_args.extend(compile_args)
+        self.extensions[0].extra_link_args.extend(link_args)
+
     def build_extensions(self) -> None:
+        if sys.platform.startswith("linux"):
+            self._harden_symbols()
         if sys.platform != "win32":
             if self._have_krb5(["krb5", "gssapi"]):
                 self.extensions[0].libraries.extend(["krb5", "gssapi"])
