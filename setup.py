@@ -126,11 +126,11 @@ class BuildExt(build_ext):
 
 
 class BuildPy(build_py):
-    """Custom build_py to carry the location of the bundled native dependencies."""
+    """Custom build_py to ship the licenses of the libraries bundled into the wheel."""
 
-    # The prefix the native dependencies were installed into for the build. Only a wheel
-    # build sets it, so BuildExt reads it back from here to decide whether to define
-    # BONSAI_BUNDLED.
+    # The prefix .ci/build-dependencies.sh installed the native dependencies into for the
+    # build. Only a wheel build sets it, so BuildExt reads it back from here to decide
+    # whether to define BONSAI_BUNDLED.
     user_options = build_py.user_options + [
         (
             "bundled-deps=",
@@ -142,6 +142,51 @@ class BuildPy(build_py):
     def initialize_options(self) -> None:
         super().initialize_options()
         self.bundled_deps = None
+
+    def _copy_licenses(self, prefix: str) -> None:
+        """Ship the licenses of the libraries the wheel redistributes.
+
+        They go next to the package so that anyone auditing an installed wheel can list
+        what it carries without unpacking or reverse engineering it. The build fails when
+        they are missing, since a wheel that redistributes these libraries without their
+        licenses does not satisfy their terms.
+        """
+        src_dir = os.path.join(prefix, "licenses")
+        names = sorted(
+            name for name in os.listdir(src_dir) if name.endswith(".txt")
+        ) if os.path.isdir(src_dir) else []
+        if not names:
+            raise RuntimeError(
+                f"no bundled licenses in {src_dir}; the dependency build must collect them"
+            )
+        dst_dir = os.path.join(self.build_lib, "bonsai", "licenses")
+        os.makedirs(dst_dir, exist_ok=True)
+        for name in names:
+            self.copy_file(os.path.join(src_dir, name), os.path.join(dst_dir, name))
+
+        # The versions matter more than the license text for anyone matching this wheel
+        # against a CVE, so a missing version file fails the build rather than quietly
+        # producing an inventory with no versions in it.
+        versions = os.path.join(prefix, "bundled-versions.env")
+        if not os.path.isfile(versions):
+            raise RuntimeError(f"{versions} is missing, cannot record bundled versions")
+        lines = ["This wheel redistributes the following libraries in binary form.", ""]
+        with open(versions) as src:
+            for line in src:
+                key, _, value = line.strip().partition("=")
+                key = key.replace("BONSAI_BUNDLED_", "").replace("_VERSION", "")
+                if key and value:
+                    lines.append(f"{key.lower()} {value}")
+        if len(lines) == 2:
+            raise RuntimeError(f"no versions parsed from {versions}")
+        lines += ["", "Their licenses are the other .txt files in this directory."]
+        with open(os.path.join(dst_dir, "BUNDLED.txt"), "w") as dst:
+            dst.write("\n".join(lines) + "\n")
+
+    def run(self) -> None:
+        super().run()
+        if self.bundled_deps:
+            self._copy_licenses(self.bundled_deps)
 
 
 SOURCES = [
