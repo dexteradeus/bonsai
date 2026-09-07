@@ -138,6 +138,50 @@ make install_sw
 register_library_path
 
 # ---------------------------------------------------------------------------------------
+# MIT Kerberos: shared, bundled by auditwheel
+# ---------------------------------------------------------------------------------------
+# Built here rather than installed from the base image, which would otherwise give the
+# manylinux and musllinux wheels different Kerberos versions. Must precede Cyrus SASL, which
+# needs these headers to build its GSSAPI mechanism.
+# -rpath-link in LDFLAGS below: the linker resolves the transitive dependencies of the
+# libraries built here through the loader search path, which musl keeps in a file that
+# the linker does not read, so it must be named explicitly.
+log "Building MIT Kerberos ${KRB5_VERSION}"
+cd "${BUILD_DIR}"
+curl -fsSL "https://kerberos.org/dist/krb5/${KRB5_VERSION%.*}/krb5-${KRB5_VERSION}.tar.gz" | tar xzf -
+cd "krb5-${KRB5_VERSION}/src"
+# --disable-nls: translated Kerberos messages are not worth a libintl dependency, and on musl
+# dgettext lives outside libc, where krb5 does not add -lintl and fails to link.
+./configure --prefix="${PREFIX}" \
+    --enable-shared --disable-static \
+    --without-ldap --without-tcl --without-readline --without-libedit \
+    --disable-rpath --disable-nls \
+    CPPFLAGS="-I${PREFIX}/include" \
+    LDFLAGS="-L${PREFIX}/lib -Wl,-rpath-link,${PREFIX}/lib"
+
+# Remove dynamic plugin loading, for the same reason OpenSSL is built no-dso: Kerberos
+# compiles ${PREFIX}/lib/krb5/plugins and ${PREFIX}/lib/gss into libkrb5 and dlopen()s
+# modules from there, the wheel ships none, and ${PREFIX} does not exist where the wheel is
+# installed. Clearing USE_DLOPEN leaves util/support/plugins.c on its open_plugin_dummy()
+# branch, which upstream maintains for platforms without dynamic loading; built-in modules
+# go through k5_plugin_register and are unaffected.
+#
+# Edited in the generated header rather than passed to configure. USE_DLOPEN comes from an
+# AC_SEARCH_LIBS feature test with no --disable switch, and presetting ac_cv_search_dlopen
+# does suppress the define -- but the same conditional also sets DL_LIB, so -ldl drops off
+# every link line and tests/gssapi/reload.c, which calls dlopen directly, fails to link.
+sed -i 's|^#define USE_DLOPEN 1$|/* USE_DLOPEN cleared: see .ci/build-dependencies.sh */|' \
+    include/autoconf.h
+if grep -q '^#define USE_DLOPEN' include/autoconf.h; then
+    fail "USE_DLOPEN survived in krb5 autoconf.h: dynamic plugin loading was not removed"
+fi
+
+make -j"${JOBS}"
+make install
+
+register_library_path
+
+# ---------------------------------------------------------------------------------------
 # Cyrus SASL: static archive, mechanisms compiled in
 # ---------------------------------------------------------------------------------------
 # This is the part that makes wheels possible at all, and it is easy to break silently.
@@ -195,12 +239,13 @@ patch -p1 < "${SOURCE_DIR}/.ci/patches/0002-digestmd5-load-openssl-legacy-provid
     --enable-static --disable-shared \
     --enable-scram --enable-digest --enable-cram --enable-plain --enable-anon \
     --enable-ntlm \
-    --disable-gssapi --disable-otp --disable-srp --disable-sample \
+    --enable-gssapi="${PREFIX}" --with-gss_impl=mit \
+    --disable-otp --disable-srp --disable-sample \
     --without-dblib --without-saslauthd --without-pwcheck \
     --with-openssl="${PREFIX}" \
     CFLAGS="-fPIC -D_GNU_SOURCE -include time.h -I${PREFIX}/include" \
-    LDFLAGS="-L${PREFIX}/lib" \
-    LIBS="-lcrypto"
+    LDFLAGS="-L${PREFIX}/lib -Wl,-rpath-link,${PREFIX}/lib" \
+    LIBS="-lcrypto -lgssapi_krb5 -lkrb5"
 
 # Cyrus SASL does not fail when it cannot find OpenSSL. It drops SCRAM entirely, prints a
 # warning, and exits 0. A wheel built that way advertises mechanisms it does not have and
@@ -214,12 +259,12 @@ make -j"${JOBS}"
 make install
 
 sasl_symbols=$(nm "${PREFIX}/lib/libsasl2.a")
-for mech in plain anonymous crammd5 digestmd5 scram external ntlm; do
+for mech in plain anonymous crammd5 digestmd5 scram external ntlm gssapiv2; do
     if [[ "${sasl_symbols}" != *" T ${mech}_client_plug_init"* ]]; then
         fail "mechanism ${mech} missing from libsasl2.a"
     fi
 done
-echo "  All seven client mechanisms present in libsasl2.a."
+echo "  All eight client mechanisms present in libsasl2.a."
 
 for cipher in enc_rc4 enc_des enc_3des; do
     if [[ "${sasl_symbols}" != *"${cipher}"* ]]; then
@@ -250,8 +295,8 @@ cd "openldap-${OPENLDAP_VERSION}"
     --disable-slapd --disable-backends --disable-overlays \
     --enable-shared --disable-static \
     CPPFLAGS="-I${PREFIX}/include" \
-    LDFLAGS="-L${PREFIX}/lib" \
-    LIBS="-lcrypto -ldl -lresolv"
+    LDFLAGS="-L${PREFIX}/lib -Wl,-rpath-link,${PREFIX}/lib" \
+    LIBS="-lcrypto -ldl -lresolv -lgssapi_krb5 -lkrb5"
 make depend
 make -j"${JOBS}"
 make install
@@ -277,11 +322,30 @@ if [[ "${ldap_undefined}" == *dlopen* || "${ldap_undefined}" == *dlsym* ]]; then
 fi
 
 ldap_symbols=$(nm --defined-only "${LIBLDAP}")
-for mech in plain anonymous crammd5 digestmd5 scram external ntlm; do
+for mech in plain anonymous crammd5 digestmd5 scram external ntlm gssapiv2; do
     if [[ "${ldap_symbols}" != *"${mech}_client_plug_init"* ]]; then
         fail "mechanism ${mech} was not absorbed into libldap"
     fi
 done
+# The build images ship their own OpenSSL and Kerberos, so a missing -L or a stale loader
+# path resolves happily against those instead, producing a wheel that bundles whatever the
+# image had rather than the pinned versions above. Nothing downstream would notice: the
+# wheel imports, binds, and reports the wrong library versions only under inspection.
+log "Verifying every bundled dependency resolves inside ${PREFIX}"
+ldap_resolved=$(LD_LIBRARY_PATH="${PREFIX}/lib" ldd "${LIBLDAP}")
+while read -r soname arrow target _; do
+    [ "${arrow}" = "=>" ] || continue
+    case "${soname}" in
+        libssl*|libcrypto*|liblber*|libldap*|libgssapi_krb5*|libkrb5*|libk5crypto*|libcom_err*)
+            case "${target}" in
+                "${PREFIX}"/*) ;;
+                *) fail "${soname} resolved to ${target}, not the build in ${PREFIX}" ;;
+            esac
+            echo "  ${soname} -> ${target}"
+            ;;
+    esac
+done <<< "${ldap_resolved}"
+
 # No bundled library may load code at run time. Each of them compiles an absolute plugin or
 # module directory under ${PREFIX} into itself -- libldap's SASL_PATH, OpenSSL's MODULESDIR
 # and ENGINESDIR, Kerberos's lib/krb5/plugins and lib/gss -- and dlopen()s from it verbatim,
@@ -305,7 +369,7 @@ for lib in "${PREFIX}"/lib/*.so.*; do
 done
 
 echo "  ${LIBLDAP}"
-echo "  No libsasl2 dependency, no dlopen/dlsym imports, all seven mechanisms absorbed."
+echo "  No libsasl2 dependency, no dlopen/dlsym imports, all eight mechanisms absorbed."
 
 # Refresh the loader cache, which is what lets the wheel build link against the libldap and
 # liblber installed above.
@@ -317,7 +381,7 @@ log "Collecting third-party licenses"
 mkdir -p "${PREFIX}/licenses"
 collect_license() {
     local name="$1" dir="$2" found=""
-    for candidate in LICENSE LICENSE.txt COPYING COPYRIGHT; do
+    for candidate in LICENSE LICENSE.txt COPYING COPYRIGHT NOTICE; do
         if [ -f "${dir}/${candidate}" ]; then
             cat "${dir}/${candidate}" >> "${PREFIX}/licenses/${name}.txt"
             found="yes"
@@ -329,12 +393,14 @@ collect_license() {
 collect_license openssl    "${BUILD_DIR}/openssl-${OPENSSL_VERSION}"
 collect_license cyrus-sasl "${BUILD_DIR}/cyrus-sasl-${CYRUS_SASL_VERSION}"
 collect_license openldap   "${BUILD_DIR}/openldap-${OPENLDAP_VERSION}"
+collect_license krb5       "${BUILD_DIR}/krb5-${KRB5_VERSION}"
 
 # Record what was bundled, so the wheel build can report these versions at run time.
 cat > "${PREFIX}/bundled-versions.env" <<EOF
 BONSAI_BUNDLED_OPENSSL_VERSION=${OPENSSL_VERSION}
 BONSAI_BUNDLED_CYRUS_SASL_VERSION=${CYRUS_SASL_VERSION}
 BONSAI_BUNDLED_OPENLDAP_VERSION=${OPENLDAP_VERSION}
+BONSAI_BUNDLED_KRB5_VERSION=${KRB5_VERSION}
 EOF
 
 log "Dependencies built into ${PREFIX}"
