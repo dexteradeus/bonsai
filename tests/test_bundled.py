@@ -1,6 +1,7 @@
 import os
 import pathlib
 import posixpath
+import re
 import subprocess
 import sys
 
@@ -12,6 +13,11 @@ from bonsai import _bundled
 bundled_only = pytest.mark.skipif(
     not _bundled.is_bundled(),
     reason="only applies to wheels that bundle their own libraries",
+)
+
+source_only = pytest.mark.skipif(
+    _bundled.is_bundled(),
+    reason="only applies to builds that link against the system libraries",
 )
 
 
@@ -201,35 +207,151 @@ def test_bundled_inventory_lists_versions():
     assert len(versions) >= 3, f"expected three versioned entries, got {versions}"
 
 
+# Each library stamps its own version into its object, so these read back what
+# was actually built rather than what the build was asked for. Checking the
+# inventory against them covers .ci/deps.env too, since BUNDLED.txt is generated
+# from it by substitution: a tarball that does not match the pin shows up here
+# as a disagreement.
+#
+# SASL is read from libldap, which absorbs the mechanisms, so there is no
+# libsasl2 to inspect. Its marker is the bare SASL_VERSION_STRING rather than an
+# identifying phrase, because the phrases OpenLDAP wraps it in are emitted on
+# glibc but not on musl. That is only safe while it is the single standalone
+# version token in the object, which the test enforces.
+BUNDLED_VERSION_MARKERS = (
+    ("openssl", "libcrypto-*.so*", rb"OpenSSL (\d+\.\d+\.\d+)"),
+    ("openldap", "libldap-*.so*", rb"\$OpenLDAP: libldap\.la (\d+\.\d+\.\d+)"),
+    ("cyrus_sasl", "libldap-*.so*", rb"\x00(\d+\.\d+\.\d+)\x00"),
+    ("krb5", "libkrb5-*.so*", rb"KRB5_BRAND: krb5-(\d+\.\d+(?:\.\d+)?)"),
+)
+
+
+EXPECTED_SONAMES = (
+    "libldap",
+    "liblber",
+    "libcrypto",
+    "libssl",
+    "libkrb5",
+    "libgssapi_krb5",
+)
+
+
+def _bundled_lib_dir():
+    """Locate the directory the bundled libraries were repaired into."""
+    # Not a skip: reaching here means the extension was compiled with
+    # BONSAI_BUNDLED, so the wheel claims to carry its own libraries, and a
+    # missing directory is that claim being false rather than a configuration
+    # this test does not apply to.
+    lib_dir = pathlib.Path(bonsai.__file__).parent.parent / "bonsai.libs"
+    assert lib_dir.is_dir(), (
+        f"the build is marked bundled but {lib_dir} does not exist;"
+        " the wheel was never repaired, or was repaired without bundling anything"
+    )
+    return lib_dir
+
+
+@bundled_only
+def test_bundled_libraries_are_shipped():
+    """A bundled wheel with no libraries would resolve against the host instead."""
+    # auditwheel renames each library with a hash of its contents, so they are
+    # matched on the soname prefix rather than by exact filename.
+    contents = sorted(path.name for path in _bundled_lib_dir().iterdir())
+    missing = [
+        soname
+        for soname in EXPECTED_SONAMES
+        if not any(name.startswith(soname) for name in contents)
+    ]
+    assert not missing, f"missing from bonsai.libs: {missing}, have {contents}"
+
+
+def _inventory_versions():
+    """Parse BUNDLED.txt back into {library: version}."""
+    inventory = pathlib.Path(bonsai.__file__).parent / "licenses" / "BUNDLED.txt"
+    entries = {}
+    for line in inventory.read_text().splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1][0].isdigit():
+            entries[parts[0]] = parts[1]
+    return entries
+
+
+@bundled_only
+@pytest.mark.parametrize("library, glob, marker", BUNDLED_VERSION_MARKERS)
+def test_inventory_matches_the_linked_libraries(library, glob, marker):
+    """An inventory that disagrees with the object it describes is worse than none."""
+    lib_dir = _bundled_lib_dir()
+    matches = sorted(lib_dir.glob(glob))
+    assert len(matches) == 1, f"expected one {glob} in {lib_dir}, got {matches}"
+
+    lib = matches[0]
+    found = {hit.group(1).decode() for hit in re.finditer(marker, lib.read_bytes())}
+    assert found, f"no version marker {marker!r} in {lib.name}"
+    assert len(found) == 1, f"{lib.name} reports several versions: {sorted(found)}"
+    linked = found.pop()
+
+    declared = _inventory_versions().get(library)
+    assert declared == linked, (
+        f"BUNDLED.txt says {library} {declared}, {lib.name} reports {linked}"
+    )
+
+
+def _run_binutil(*args):
+    """Run a binary-inspection tool, skipping the test where it is not installed.
+
+    Minimal build containers often lack binutils, and a missing tool must not read as a
+    failing assertion about the wheel.
+    """
+    if not sys.platform.startswith("linux"):
+        pytest.skip("ELF inspection is platform specific")
+    try:
+        out = subprocess.run(args, capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        pytest.skip(f"{args[0]} is not available")
+    # Only a tool that produced nothing has really failed. musl's ldd relocates
+    # as well as resolves, so on an extension module it exits non-zero over the
+    # interpreter symbols that exist only in a running process, while still
+    # printing correct resolution on stdout.
+    if out.returncode != 0 and not out.stdout.strip():
+        pytest.skip(f"{args[0]} failed: {out.stderr.strip()[:60]}")
+    return out.stdout
+
+
 @bundled_only
 def test_extension_exports_only_its_init_symbol():
     """Generic globals in the extension could otherwise collide with another."""
-    if not sys.platform.startswith("linux"):
-        pytest.skip("nm and ELF symbol visibility are platform specific")
-    out = subprocess.run(
-        ["nm", "-D", "--defined-only", bonsai._bonsai.__file__],
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        pytest.skip("nm is not available")
-    exported = [line.split()[-1] for line in out.stdout.splitlines() if line.strip()]
+    stdout = _run_binutil("nm", "-D", "--defined-only", bonsai._bonsai.__file__)
+    exported = [line.split()[-1] for line in stdout.splitlines() if line.strip()]
     assert exported == ["PyInit__bonsai"], f"unexpected exports: {exported}"
 
 
 @bundled_only
 def test_no_system_ldap_or_sasl_is_used():
     """The wheel resolves its own libraries, not whatever the host happens to have."""
-    if not sys.platform.startswith("linux"):
-        pytest.skip("ldd is Linux specific")
-    out = subprocess.run(
-        ["ldd", bonsai._bonsai.__file__], capture_output=True, text=True
-    )
-    if out.returncode != 0:
-        pytest.skip("ldd is not available")
-    for line in out.stdout.splitlines():
+    stdout = _run_binutil("ldd", bonsai._bonsai.__file__)
+    for line in stdout.splitlines():
         if any(name in line for name in ("libldap", "liblber", "libsasl")):
             assert "bonsai.libs" in line, f"resolved outside the wheel: {line.strip()}"
+
+
+@source_only
+def test_source_build_carries_no_bundled_artifacts():
+    """`--no-binary bonsai` has to leave these libraries to the package manager."""
+    package = pathlib.Path(bonsai.__file__).parent
+    # Not to be confused with bonsai-<version>.dist-info/licenses/LICENSE, which
+    # is bonsai's own and ships either way. This is the inventory BuildPy writes
+    # beside the package, and only a bundled build has one.
+    assert not (package / "licenses").exists(), "carries a bundled license inventory"
+    assert not (package.parent / "bonsai.libs").exists(), "carries bundled libraries"
+
+
+@source_only
+def test_source_build_resolves_outside_the_package():
+    """The mirror of the bundled case: it must link what the system installed."""
+    stdout = _run_binutil("ldd", bonsai._bonsai.__file__)
+    resolved = [line for line in stdout.splitlines() if "libldap" in line]
+    assert resolved, f"the extension does not link libldap at all:\n{stdout}"
+    for line in resolved:
+        assert "bonsai.libs" not in line, f"resolved inside the package: {line.strip()}"
 
 
 @bundled_only

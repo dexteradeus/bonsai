@@ -27,6 +27,18 @@ def silent_stderr():
 class BuildExt(build_ext):
     """Custom build_ext to test Kerberose capability."""
 
+    def finalize_options(self) -> None:
+        super().finalize_options()
+        prefix = self.get_finalized_command("build_py").bundled_deps
+        if prefix:
+            # Prepended, so a bundled build finds its own headers and libraries
+            # before the system ones the checked-in setup.cfg names. Done here
+            # rather than in build_extensions() because run() copies both lists
+            # onto the compiler before calling it, and a later change would
+            # reach _have_krb5 but not the extension.
+            self.include_dirs.insert(0, os.path.join(prefix, "include"))
+            self.library_dirs.insert(0, os.path.join(prefix, "lib"))
+
     def _have_krb5(self, libs: list) -> bool:
         code = """
         #include <krb5.h>
@@ -131,7 +143,8 @@ class BuildPy(build_py):
 
     # The prefix .ci/build-dependencies.sh installed the native dependencies
     # into for the build. Only a wheel build sets it, so BuildExt reads it back
-    # from here to decide whether to define BONSAI_BUNDLED.
+    # from here to decide whether to define BONSAI_BUNDLED and where to look for
+    # the headers and libraries.
     user_options = build_py.user_options + [
         (
             "bundled-deps=",
