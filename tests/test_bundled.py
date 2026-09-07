@@ -194,33 +194,39 @@ def test_bundled_inventory_lists_versions():
     assert len(versions) >= 3, f"expected three versioned entries, got {versions}"
 
 
+def _run_binutil(*args):
+    """Run a binary-inspection tool, skipping the test where it is not installed.
+
+    Minimal build containers often lack binutils, and a missing tool must not read as a
+    failing assertion about the wheel.
+    """
+    if not sys.platform.startswith("linux"):
+        pytest.skip("ELF inspection is platform specific")
+    try:
+        out = subprocess.run(args, capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        pytest.skip(f"{args[0]} is not available")
+    # Only a tool that produced nothing has really failed. musl's ldd relocates as well as
+    # resolves, so on an extension module it exits non-zero over the interpreter symbols that
+    # exist only in a running process, while still printing correct resolution on stdout.
+    if out.returncode != 0 and not out.stdout.strip():
+        pytest.skip(f"{args[0]} failed: {out.stderr.strip()[:60]}")
+    return out.stdout
+
+
 @bundled_only
 def test_extension_exports_only_its_init_symbol():
     """Generic globals in the extension would otherwise be able to collide with another one."""
-    if not sys.platform.startswith("linux"):
-        pytest.skip("nm and ELF symbol visibility are platform specific")
-    out = subprocess.run(
-        ["nm", "-D", "--defined-only", bonsai._bonsai.__file__],
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode != 0:
-        pytest.skip("nm is not available")
-    exported = [line.split()[-1] for line in out.stdout.splitlines() if line.strip()]
+    stdout = _run_binutil("nm", "-D", "--defined-only", bonsai._bonsai.__file__)
+    exported = [line.split()[-1] for line in stdout.splitlines() if line.strip()]
     assert exported == ["PyInit__bonsai"], f"unexpected exports: {exported}"
 
 
 @bundled_only
 def test_no_system_ldap_or_sasl_is_used():
     """The wheel has to resolve its own libraries, not whatever the host happens to have."""
-    if not sys.platform.startswith("linux"):
-        pytest.skip("ldd is Linux specific")
-    out = subprocess.run(
-        ["ldd", bonsai._bonsai.__file__], capture_output=True, text=True
-    )
-    if out.returncode != 0:
-        pytest.skip("ldd is not available")
-    for line in out.stdout.splitlines():
+    stdout = _run_binutil("ldd", bonsai._bonsai.__file__)
+    for line in stdout.splitlines():
         if any(name in line for name in ("libldap", "liblber", "libsasl")):
             assert "bonsai.libs" in line, f"resolved outside the wheel: {line.strip()}"
 
