@@ -26,7 +26,7 @@ SOURCE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 source "${SOURCE_DIR}/.ci/deps.env"
 
 PREFIX="${BONSAI_DEPS_PREFIX:-/opt/bonsai-deps}"
-BUILD_DIR="${BONSAI_BUILD_DIR:-/tmp/bonsai-deps-build}"
+BUILD_DIR="${BONSAI_BUILD_DIR:-/opt/bonsai-deps-build}"
 JOBS="$(nproc)"
 
 mkdir -p "${BUILD_DIR}" "${PREFIX}"
@@ -152,7 +152,7 @@ curl -fsSL "https://kerberos.org/dist/krb5/${KRB5_VERSION%.*}/krb5-${KRB5_VERSIO
 cd "krb5-${KRB5_VERSION}/src"
 # --disable-nls: translated Kerberos messages are not worth a libintl dependency, and on musl
 # dgettext lives outside libc, where krb5 does not add -lintl and fails to link.
-./configure --prefix="${PREFIX}" \
+./configure --prefix="${PREFIX}" --sysconfdir=/etc --localstatedir=/var \
     --enable-shared --disable-static \
     --without-ldap --without-tcl --without-readline --without-libedit \
     --disable-rpath --disable-nls \
@@ -290,7 +290,7 @@ log "Building OpenLDAP ${OPENLDAP_VERSION} (shared, absorbing libsasl2.a)"
 cd "${BUILD_DIR}"
 curl -fsSL "https://www.openldap.org/software/download/OpenLDAP/openldap-release/openldap-${OPENLDAP_VERSION}.tgz" | tar xzf -
 cd "openldap-${OPENLDAP_VERSION}"
-./configure --prefix="${PREFIX}" \
+./configure --prefix="${PREFIX}" --sysconfdir=/etc \
     --with-cyrus-sasl --with-tls=openssl \
     --disable-slapd --disable-backends --disable-overlays \
     --enable-shared --disable-static \
